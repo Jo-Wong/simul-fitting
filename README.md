@@ -5,16 +5,11 @@ This is a library package for fitting pulsar/nebula polarization in IXPE data. S
 The directory is organized as follows:
 
 simul-fitting/
-
-├─ constants.py
-
-├─ functions.py
-
-├─ main.py
-
-├─ par/
-
-│  ├─ 20eqph\_2-8keV\_13x13\_15as.par
+|─ constants.py
+|─ functions.py
+|─ main.py
+|─ par/
+|  |─ 20eqph\_2-8keV\_13x13\_15as.par
 
 <ins>main.py</ins>
 Runs simultaneous fitting. Initializes the binning parameters. Applies binning to the IXPE data and the IXPEobssim pulsar and nebula simulations. Runs the least-squares minimization algorithm to solve for the pulsar phase-resolved and nebula spatially-varying polarization

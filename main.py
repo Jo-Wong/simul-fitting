@@ -6,7 +6,7 @@ obsids = ['04001299']
 Constants = Constants_Crab()
 
 # read the parameter file
-param_dict = Constants.read_parameters('par/simulfit.par', obsids)
+param_dict = Constants.read_parameters('par/20eqph_2-8keV_13x13_15as.par', obsids)
 dfiles = Constants.get_obsids(obsids, 'DFILES')
 pfiles = Constants.get_obsids(obsids, 'SFILES')
 nfiles = Constants.get_obsids(obsids, 'SFILES')
