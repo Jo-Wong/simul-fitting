@@ -1,0 +1,8 @@
+PHASE_BINS     np.linspace(0,1,21)
+ENERGY_BINS    [2,8]
+SPATIAL_BIN_T  'grid'
+SPATIAL_BIN_P  'pix_width' 15
+SPATIAL_BIN_P  'img_width' (195,195)
+WEIGHTS        True
+ROT_PH         0.53
+DETECTORS      [1,3]
