@@ -1,4 +1,5 @@
 import numpy as np
+import sys
 import os
 import copy
 import scipy
@@ -12,10 +13,11 @@ from ixpeobssim.irf.modf import xModulationFactor
 from ixpeobssim.utils.astro import angular_separation, square_sky_grid
 from ixpeobssim.utils.units_ import degrees_to_arcmin
 
+SCRATCH_FOLDER = os.environ['SCRATCH_FOLDER']
 RESP_FOLDER  = os.environ['PYTHONPATH'].split(':')[-1] + '/ixpeobssim/caldb/ixpe/'
 
 DATA_LABELS = ['PHASE', 'ENERGY', 'RA', 'DEC', 'Q', 'U', 'W', 'MU']
-CUBE_LABELS = ['I', 'WQ/MU', 'WU/MU', 'W', 'W2', 'WMU']
+CUBE_LABELS = ['I', 'WQ/MU', 'WU/MU', 'W', 'W2', 'WMU', 'VAR_Q', 'VAR_U']
 
 def midpoints(array):
     """  
@@ -80,6 +82,23 @@ def create_header(param_dict):
      
     return header
 
+def generate_lc(dfiles, dfolder, param_dict, nbins=100, kernel=None):
+   """ 
+   generate a lightcurve using the same binning, except uniform phase bins
+   """
+   param_dict_lc = copy.deepcopy(param_dict)
+   param_dict_lc['PHASE_BINS'] = np.linspace(0,1,nbins+1)
+
+   cube = generate_cube(dfiles, dfolder, param_dict_lc, 'DATA')
+
+   lc_x = midpoints(param_dict_lc['PHASE_BINS'])
+   lc = np.sum(cube['I'], axis=(0,1,3,4,5))
+
+   if kernel is not None:
+      lc = np.convolve(lc, kernel, mode='same')
+
+   return lc_x, lc
+
 def array_to_fits(outfile, data_array, header = None):
     """  
     Creates a FITS file from a data stored as an ndarray
@@ -94,7 +113,7 @@ def find_pol(norm_q, norm_qerr, norm_u, norm_uerr):
     pa = np.rad2deg(0.5 * np.arctan2(norm_u, norm_q))
     pd_err = np.sqrt((norm_q * norm_qerr)**2 + (norm_u * norm_uerr)**2) / pd 
     pa_err = np.rad2deg(( 0.5 * np.sqrt((norm_u * norm_qerr)**2 + (norm_q * norm_uerr)**2 ) / pd**2))
-    pa_err = pa_err % 180
+    pa_err = pa_err
     sig = pd / pd_err
     
     return pd, pd_err, pa, pa_err, sig
@@ -186,14 +205,14 @@ def save_polmap(pd_n, pa_n, sig_n, pi_outfile, pa_outfile, sig_outfile, param_di
     hdul = fits.HDUList([fits.PrimaryHDU(header = header, data = sig_n)])
     hdul.writeto(sig_outfile, overwrite = True)
 
-def shift_center(d_ra, d_dec, param_dict):
+def shift_center(shift_ra, shift_dec, obj, param_dict):
    """
    Perform artifical shifts to the RA/DEC in <param_dict> for calibration.
    + d_ra: will shift image to the right
    + d_dec: will shift image upward
    """
-   param_dict['DEC'] = Constants.DEC - shift_dec / 3600
-   param_dict['RA'] = Constants.RA + shift_ra / 3600 / np.cos(np.radians(param_dict['DEC']))
+   param_dict['DEC'] = obj.DEC - shift_dec / 3600
+   param_dict['RA'] = obj.RA + shift_ra / 3600 / np.cos(np.radians(param_dict['DEC']))
 
    return param_dict
 
@@ -334,7 +353,7 @@ def print_parameters(params, suppress=False):
 
         print('RA: ', params['RA'])
         print('DEC: ', params['DEC'])
-        print('Weights on/off: ', ('On' if params['WEIGHTS'] else 'Off'))
+        print('Weights: ', params['WEIGHTS'])
         if len(set(np.diff(phase_bins))) == 1:
             print('Phase binning: equal-width, %d bins' % num_phase)
         else:
@@ -365,7 +384,7 @@ def print_parameters(params, suppress=False):
 
         print('Cube Shape: ', (num_phase, num_energy, num_dec, num_ra))
 
-        print('Response function: ', [params['RESP_NAME'][i][0] % 'alpha075_' if params['WEIGHTS'] else params['RESP_NAME'][i][0] % '' for i in range(len(params['RESP_NAME']))])
+        print('Response function: ', [params['RESP_NAME'][i][0] for i in range(len(params['RESP_NAME']))])
 
         print('Model phase rotation: ', params['ROT_PH'])
 
@@ -397,12 +416,16 @@ def load_data(fits_folder, fits_file, data_type, params, resp_name, use_proxy_we
 
     weights = params['WEIGHTS']
 
-    if weights:
-        resp_name = resp_name % 'alpha075_'
-    else:
+    if weights == 'None' or weights == 'MLE':
         resp_name = resp_name % ''
-
-    modf = xModulationFactor(response_file(truncate(resp_name), 'MODF'))
+        modf = xModulationFactor(response_file(truncate(resp_name), 'MODF'))
+    elif weights == 'MOM':
+        resp_name = resp_name % 'alpha075_'
+        modf = xModulationFactor(response_file(truncate(resp_name), 'MODF'))
+    elif weights == 'NN':
+        modf = xModulationFactor(f'/scratch/users/joswong/IXPENN/ixpenn/IXPEML/caldb/{resp_name.replace("v011", "mfact_v011")}.fits')
+    else:
+        raise ValueError("WEIGHT must be 'None', 'MLE', 'MOM', or 'NN'")
 
     if data_type == 'DATA':
         phase, energy, ra, dec = process_data(fname)
@@ -426,29 +449,45 @@ def load_data(fits_folder, fits_file, data_type, params, resp_name, use_proxy_we
     data['U'] = devt['U']
     data['MU'] = modf(energy)
 
-    if weights:
-        if use_proxy_weights is not None:
-            print('using proxy weights')
-
-            wmom_proxy_list, ebins = np.load(use_proxy_weights, allow_pickle=True)
-            indices = np.digitize(data['ENERGY'], ebins.tolist())
-            wmom_proxy = np.zeros(len(indices))
-
-            for idx, (e1, e2) in enumerate(zip(ebins[0:-1], ebins[1:])):
-                key = '%.1f_%.1f' % (e1, e2)
-                wmom_proxy[indices==idx+1] = np.random.choice(wmom_proxy_list[key], np.sum(indices==idx+1), replace=True)
-
-
-            data['W'] = wmom_proxy
-            del ebins, wmom_proxy_list
-
-        else:
-            print('using wmom col')
-            data['W'] = devt['W_MOM']
+    if data_type != 'MODEL':
+        if (weights == 'MLE' or weights == 'MOM' or weights == 'NN'):
+            if use_proxy_weights is not None:
+                '''
+                print('using proxy weights')
+ 
+                wmom_proxy_list, ebins = np.load(use_proxy_weights, allow_pickle=True)
+                indices = np.digitize(data['ENERGY'], ebins.tolist())
+                wmom_proxy = np.zeros(len(indices))
+ 
+                for idx, (e1, e2) in enumerate(zip(ebins[0:-1], ebins[1:])):
+                    key = '%.1f_%.1f' % (e1, e2)
+                    wmom_proxy[indices==idx+1] = np.random.choice(wmom_proxy_list[key], np.sum(indices==idx+1), replace=True)
+ 
+ 
+                data['W'] = wmom_proxy
+                del ebins, wmom_proxy_list
+                '''
+                raise ValueError('use_proxy_weights is disabled for now, only using I model')
+ 
+            elif weights == 'MLE':
+                data['W'] = data['MU']**2
+ 
+            elif weights == 'MOM':
+                data['W'] = devt['W_MOM']
+ 
+            elif weights == 'NN':
+                if 'W_NN' in devt.columns.names:
+                    data['W'] = devt['W_NN']
+                else:
+                    raise ValueError('in order to use NN weighting, must have W_NN column')
+                    #data['W'] = np.ones(len(energy))
+     
+        elif weights == 'None':
+            data['W'] = np.ones(len(energy))
 
     else:
         data['W'] = np.ones(len(energy))
-
+ 
     # If region file provided for spatial filtering, filter now:
     if params['SPATIAL_BIN_T'] == 'file':
         mask = xEventFile(fname).ds9_region_file_mask(params['SPATIAL_BIN_P']['filepath'], mc=False)
@@ -551,6 +590,10 @@ def bin_data(data_dict, params):
                         cube['W'][i][j][k][len(ra_bins)-2-l] = np.sum(wm[mask])
                         cube['W2'][i][j][k][len(ra_bins)-2-l] = np.sum(wm[mask]**2)
                         cube['WMU'][i][j][k][len(ra_bins)-2-l] = np.sum(wm[mask] * mum[mask])
+                        avg_q = cube['WQ/MU'][i][j][k][len(ra_bins)-2-l] / cube['W'][i][j][k][len(ra_bins)-2-l]
+                        avg_u = cube['WU/MU'][i][j][k][len(ra_bins)-2-l] / cube['W'][i][j][k][len(ra_bins)-2-l]
+                        cube['VAR_Q'][i][j][k][len(ra_bins)-2-l] = np.sum(wm[mask]**2 * (2/mum[mask]**2 - avg_q**2))
+                        cube['VAR_U'][i][j][k][len(ra_bins)-2-l] = np.sum(wm[mask]**2 * (2/mum[mask]**2 - avg_u**2))
 
             if params['SPATIAL_BIN_T'] == 'circular' or params['SPATIAL_BIN_T'] == 'annulus':
                 sep = degrees_to_arcmin(angular_separation(rm, dm, params['RA'], params['DEC']))
@@ -567,6 +610,10 @@ def bin_data(data_dict, params):
                 cube['W'][i][j][0][0] = np.sum(wm[mask])
                 cube['W2'][i][j][0][0] = np.sum(wm[mask]**2)
                 cube['WMU'][i][j][0][0] = np.sum(wm[mask] * mum[mask])
+                avg_q = cube['WQ/MU'][i][j][0][0] / cube['W'][i][j][0][0]
+                avg_u = cube['WU/MU'][i][j][0][0] / cube['W'][i][j][0][0]
+                cube['VAR_Q'][i][j][0][0] = np.sum(wm[mask]**2 * (2/mum[mask]**2 - avg_q**2))
+                cube['VAR_U'][i][j][0][0] = np.sum(wm[mask]**2 * (2/mum[mask]**2 - avg_u**2))
 
             if params['SPATIAL_BIN_T'] == 'file':
                 cube['I'][i][j][0][0] = np.sum(mask)
@@ -575,7 +622,10 @@ def bin_data(data_dict, params):
                 cube['W'][i][j][0][0] = np.sum(wm)
                 cube['W2'][i][j][0][0] = np.sum(wm**2)
                 cube['WMU'][i][j][0][0] = np.sum(wm * mum)
-
+                avg_q = cube['WQ/MU'][i][j][0][0] / cube['W'][i][j][0][0]
+                avg_u = cube['WU/MU'][i][j][0][0] / cube['W'][i][j][0][0]
+                cube['VAR_Q'][i][j][0][0] = np.sum(wm**2 * (2/mum**2 - avg_q**2))
+                cube['VAR_U'][i][j][0][0] = np.sum(wm**2 * (2/mum**2 - avg_u**2))
     return cube
 
 def generate_cube(files, folder, params, dtype, use_proxy_weights=None):
@@ -596,6 +646,13 @@ def generate_cube(files, folder, params, dtype, use_proxy_weights=None):
     params_copy = copy.deepcopy(params)
 
     params_copy['DFILE'] = files 
+
+    # check if PHASE column exists. if not, assume for all the other files
+    with fits.open(os.path.join(folder, files[0][0])) as f:
+        if 'PHASE' not in f[1].data.columns.names:
+            print('No phase column exists. Changing PHASE_BINS = [0,1]')
+            params_copy['PHASE_BINS'] = [0,1]
+
     num_obs, num_det, num_phase, num_energy, num_dec, num_ra = print_parameters(params_copy, suppress=True)
    
     # initialize each value in <obs_cube>
@@ -610,8 +667,7 @@ def generate_cube(files, folder, params, dtype, use_proxy_weights=None):
 
             # should theoretically be outside the detector loop, but assuming that all detectors would either have or not have PHASE
             if data['PHASE'] is None: 
-                print('No phase column exists. Changing PHASE_BINS = [0,1] and creating dummy phase data = 0.5')
-                params_copy['PHASE_BINS'] = [0,1]
+                print('No phase column exists. Creating dummy phase data = 0.5')
                 data['PHASE'] = 0.5 * np.ones_like(data['ENERGY'])
 
             cube = bin_data(data, params_copy)
@@ -642,30 +698,30 @@ def long_simulation(fname, param_dict, num_sim, INPUT_FILE, use_proxy_weights):
      
     return cube 
 
-def add_covariance(dcube):
-    ''' Add VAR_Q, VAR_U, COV_QU terms to dcube'''
-    
-    # collect data and calculate covariance
-    q_tot = dcube['WQ/MU']
-    u_tot = dcube['WU/MU']
-    w_tot = dcube['W']
-    w2_tot = dcube['W2']
-    mu_tot = dcube['WMU']
-
-    avg_mu_tot = mu_tot / w_tot
-    avg_q_tot = q_tot / w_tot
-    avg_u_tot = u_tot / w_tot
-
-    avg_q_tot = np.clip(avg_q_tot, -1, 1)
-    avg_u_tot = np.clip(avg_u_tot, -1, 1)
-
-    dcube['VAR_Q'] = 2 * w2_tot / avg_mu_tot**2 * (1 - (avg_q_tot * avg_mu_tot)**2 / 2) 
-    dcube['VAR_U'] = 2 * w2_tot / avg_mu_tot**2 * (1 - (avg_u_tot * avg_mu_tot)**2 / 2) 
-    dcube['COV_QU'] = -w2_tot * avg_q_tot * avg_u_tot
+#def add_covariance(dcube):
+#    ''' Add VAR_Q, VAR_U, COV_QU terms to dcube'''
+#    
+#    # collect data and calculate covariance
+#    q_tot = dcube['WQ/MU']
+#    u_tot = dcube['WU/MU']
+#    w_tot = dcube['W']
+#    w2_tot = dcube['W2']
+#    mu_tot = dcube['WMU']
+#
+#    avg_mu_tot = mu_tot / w_tot
+#    avg_q_tot = q_tot / w_tot
+#    avg_u_tot = u_tot / w_tot
+#
+#    avg_q_tot = np.clip(avg_q_tot, -1, 1)
+#    avg_u_tot = np.clip(avg_u_tot, -1, 1)
+#
+#    dcube['VAR_Q'] = 2 * w2_tot / avg_mu_tot**2 * (1 - (avg_q_tot * avg_mu_tot)**2 / 2) 
+#    dcube['VAR_U'] = 2 * w2_tot / avg_mu_tot**2 * (1 - (avg_u_tot * avg_mu_tot)**2 / 2) 
+#    dcube['COV_QU'] = -w2_tot * avg_q_tot * avg_u_tot
 
 def simul(dcube, pcube, ncube, param_dict):
     
-    add_covariance(dcube)
+    #add_covariance(dcube)
     return simul_bare(dcube, pcube, ncube, param_dict)
 
 def simul_bare(dcube, pcube, ncube, param_dict):
@@ -680,7 +736,7 @@ def simul_bare(dcube, pcube, ncube, param_dict):
     u_tot = dcube['WU/MU']
     var_q_tot = dcube['VAR_Q']
     var_u_tot = dcube['VAR_U']
-    cov_qu_tot = dcube['COV_QU']
+    #cov_qu_tot = dcube['COV_QU']
 
     # collect parameters
     num_obs, num_det, num_phase, num_energy, num_dec, num_ra = w_tot.shape
@@ -745,8 +801,8 @@ def simul_bare(dcube, pcube, ncube, param_dict):
                         for k in range(num_ra):
                             ws[0,0] = var_q_tot[obs,det,i,l,j,k]
                             ws[1,1] = var_u_tot[obs,det,i,l,j,k]
-                            ws[1,0] = cov_qu_tot[obs,det,i,l,j,k]
-                            ws[0,1] = cov_qu_tot[obs,det,i,l,j,k]
+                            ws[1,0] = 0 #cov_qu_tot[obs,det,i,l,j,k]
+                            ws[0,1] = 0 #cov_qu_tot[obs,det,i,l,j,k]
 
                             try:
                                 ws_inv = np.linalg.inv(ws)
@@ -789,8 +845,10 @@ def simul_bare(dcube, pcube, ncube, param_dict):
 
     return norm_q, norm_u, norm_qerr, norm_uerr, A
 
-def calculate_nebula_polarization(qn, qnerr, un, unerr, A):
+def calculate_nebula_polarization(qn, qnerr, un, unerr, A, param_dict):
    ''' calculates spatially-averaged nebula polarization '''
+
+   num_det, num_phase, num_energy, num_dec, num_ra = print_parameters(param_dict, suppress=True)
 
    polarization = np.zeros(2*(num_phase+num_dec*num_ra))
    polarization[2*num_phase::2] = qn.ravel()
@@ -802,6 +860,9 @@ def calculate_nebula_polarization(qn, qnerr, un, unerr, A):
    flux[2*num_phase+1::2] = 1 
    count_flux = A @ flux
 
+   pol_avg_q = np.sum(pol_flux[::2]) / np.sum(count_flux[::2])
+   pol_avg_u = np.sum(pol_flux[1::2]) / np.sum(count_flux[::2])
+
    polarization_err = np.zeros(2*(num_phase+num_dec*num_ra))
    polarization_err[2*num_phase::2] = qnerr.ravel()**2
    polarization_err[2*num_phase+1::2] = unerr.ravel()**2
@@ -810,6 +871,7 @@ def calculate_nebula_polarization(qn, qnerr, un, unerr, A):
    pol_avg_qerr = np.sqrt(np.sum(pol_flux_err[::2]))  / np.sum(count_flux[::2])
    pol_avg_uerr = np.sqrt(np.sum(pol_flux_err[1::2])) / np.sum(count_flux[::2])
 
+   print(pol_avg_q, pol_avg_qerr, pol_avg_u, pol_avg_uerr)
    pol_avg_pd, pol_avg_pderr, pol_avg_pa, pol_avg_paerr, pol_avg_sig = find_pol(pol_avg_q, pol_avg_qerr, pol_avg_u, pol_avg_uerr)
    
    return pol_avg_pd, pol_avg_pderr, pol_avg_pa, pol_avg_paerr, pol_avg_sig
