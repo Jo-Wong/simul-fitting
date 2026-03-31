@@ -1,0 +1,8 @@
+PHASE_BINS     [0,1]
+ENERGY_BINS    [2,8]
+SPATIAL_BIN_T  'grid'
+SPATIAL_BIN_P  'pix_width' 10
+SPATIAL_BIN_P  'img_width' (60,60)
+WEIGHTS        'NN'
+ROT_PH         0.0
+DETECTORS      [1,2,3]
