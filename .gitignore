@@ -1,3 +1,3 @@
-# Ignore everything in a source_<name>/plots or source_<name>/results folder
-source_*/plots/*
-source_*/results/*
+# Ignore everything in source_<name> except source_<name>/par
+source_*
+!source_*/par
